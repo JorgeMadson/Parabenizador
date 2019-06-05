@@ -1,8 +1,9 @@
 const passport = require('passport');
-const request = require('request');
+const axios = require('axios');
 const { Strategy: InstagramStrategy } = require('passport-instagram');
 const { Strategy: LocalStrategy } = require('passport-local');
 const { Strategy: FacebookStrategy } = require('passport-facebook');
+const { Strategy: SnapchatStrategy } = require('passport-snapchat');
 const { Strategy: TwitterStrategy } = require('passport-twitter');
 const { Strategy: GitHubStrategy } = require('passport-github');
 const { OAuth2Strategy: GoogleStrategy } = require('passport-google-oauth');
@@ -10,6 +11,7 @@ const { Strategy: LinkedInStrategy } = require('passport-linkedin-oauth2');
 const { Strategy: OpenIDStrategy } = require('passport-openid');
 const { OAuthStrategy } = require('passport-oauth');
 const { OAuth2Strategy } = require('passport-oauth');
+const _ = require('lodash');
 
 const User = require('../models/User');
 
@@ -58,12 +60,66 @@ passport.use(new LocalStrategy({ usernameField: 'email' }, (email, password, don
  */
 
 /**
+ * Sign in with Snapchat.
+ */
+passport.use(new SnapchatStrategy({
+  clientID: process.env.SNAPCHAT_ID,
+  clientSecret: process.env.SNAPCHAT_SECRET,
+  callbackURL: '/auth/snapchat/callback',
+  profileFields: ['id', 'displayName', 'bitmoji'],
+  scope: ['user.display_name', 'user.bitmoji.avatar'],
+  passReqToCallback: true
+}, (req, accessToken, refreshToken, profile, done) => {
+  if (req.user) {
+    User.findOne({ snapchat: profile.id }, (err, existingUser) => {
+      if (err) { return done(err); }
+      if (existingUser) {
+        req.flash('errors', { msg: 'There is already a Snapchat account that belongs to you. Sign in with that account or delete it, then link it with your current account.' });
+        done(err);
+      } else {
+        User.findById(req.user.id, (err, user) => {
+          if (err) { return done(err); }
+          user.snapchat = profile.id;
+          user.tokens.push({ kind: 'snapchat', accessToken });
+          user.profile.name = user.profile.name || profile.displayName;
+          user.profile.gender = user.profile.gender;
+          user.profile.picture = user.profile.picture || profile.bitmoji.avatarUrl;
+          user.save((err) => {
+            req.flash('info', { msg: 'Snapchat account has been linked.' });
+            done(err, user);
+          });
+        });
+      }
+    });
+  } else {
+    User.findOne({ snapchat: profile.id }, (err, existingUser) => {
+      if (err) { return done(err); }
+      if (existingUser) {
+        return done(null, existingUser);
+      }
+      const user = new User();
+      // Similar to Twitter & Instagram APIs, assign a temporary e-mail address
+      // to get on with the registration process. It can be changed later
+      // to a valid e-mail address in Profile Management.
+      user.email = `${profile.id}@snapchat.com`;
+      user.snapchat = profile.id;
+      user.tokens.push({ kind: 'snapchat', accessToken });
+      user.profile.name = profile.displayName;
+      user.profile.picture = profile.bitmoji.avatarUrl;
+      user.save((err) => {
+        done(err, user);
+      });
+    });
+  }
+}));
+
+/**
  * Sign in with Facebook.
  */
 passport.use(new FacebookStrategy({
   clientID: process.env.FACEBOOK_ID,
   clientSecret: process.env.FACEBOOK_SECRET,
-  callbackURL: '/auth/facebook/callback',
+  callbackURL: `${process.env.BASE_URL}/auth/facebook/callback`,
   profileFields: ['name', 'email', 'link', 'locale', 'timezone', 'gender'],
   passReqToCallback: true
 }, (req, accessToken, refreshToken, profile, done) => {
@@ -123,8 +179,9 @@ passport.use(new FacebookStrategy({
 passport.use(new GitHubStrategy({
   clientID: process.env.GITHUB_ID,
   clientSecret: process.env.GITHUB_SECRET,
-  callbackURL: '/auth/github/callback',
-  passReqToCallback: true
+  callbackURL: `${process.env.BASE_URL}/auth/github/callback`,
+  passReqToCallback: true,
+  scope: ['user:email']
 }, (req, accessToken, refreshToken, profile, done) => {
   if (req.user) {
     User.findOne({ github: profile.id }, (err, existingUser) => {
@@ -160,7 +217,7 @@ passport.use(new GitHubStrategy({
           done(err);
         } else {
           const user = new User();
-          user.email = profile._json.email;
+          user.email = _.get(_.orderBy(profile.emails, ['primary', 'verified'], ['desc', 'desc']), [0, 'value'], null);
           user.github = profile.id;
           user.tokens.push({ kind: 'github', accessToken });
           user.profile.name = profile.displayName;
@@ -182,7 +239,7 @@ passport.use(new GitHubStrategy({
 passport.use(new TwitterStrategy({
   consumerKey: process.env.TWITTER_KEY,
   consumerSecret: process.env.TWITTER_SECRET,
-  callbackURL: '/auth/twitter/callback',
+  callbackURL: `${process.env.BASE_URL}/auth/twitter/callback`,
   passReqToCallback: true
 }, (req, accessToken, tokenSecret, profile, done) => {
   if (req.user) {
@@ -252,7 +309,7 @@ passport.use(new GoogleStrategy({
           user.tokens.push({ kind: 'google', accessToken });
           user.profile.name = user.profile.name || profile.displayName;
           user.profile.gender = user.profile.gender || profile._json.gender;
-          user.profile.picture = user.profile.picture || profile._json.image.url;
+          user.profile.picture = user.profile.picture || profile._json.picture;
           user.save((err) => {
             req.flash('info', { msg: 'Google account has been linked.' });
             done(err, user);
@@ -278,7 +335,7 @@ passport.use(new GoogleStrategy({
           user.tokens.push({ kind: 'google', accessToken });
           user.profile.name = profile.displayName;
           user.profile.gender = profile._json.gender;
-          user.profile.picture = profile._json.image.url;
+          user.profile.picture = profile._json.picture;
           user.save((err) => {
             done(err, user);
           });
@@ -471,29 +528,26 @@ passport.use(new OpenIDStrategy({
           if (err) { return done(err); }
           user.steam = steamId;
           user.tokens.push({ kind: 'steam', accessToken: steamId });
-          request(profileURL, (error, response, body) => {
-            if (!error && response.statusCode === 200) {
-              const data = JSON.parse(body);
-              const profile = data.response.players[0];
+          axios.get(profileURL)
+            .then((res) => {
+              const profile = res.data.response.players[0];
               user.profile.name = user.profile.name || profile.personaname;
               user.profile.picture = user.profile.picture || profile.avatarmedium;
               user.save((err) => {
                 done(err, user);
               });
-            } else {
+            })
+            .catch((err) => {
               user.save((err) => { done(err, user); });
-              done(error, null);
-            }
-          });
+              done(err, null);
+            });
         });
       }
     });
   } else {
-    request(profileURL, (error, response, body) => {
-      if (!error && response.statusCode === 200) {
-        const data = JSON.parse(body);
+    axios.get(profileURL)
+      .then(({ data }) => {
         const profile = data.response.players[0];
-
         const user = new User();
         user.steam = steamId;
         user.email = `${steamId}@steam.com`; // steam does not disclose emails, prevent duplicate keys
@@ -503,10 +557,9 @@ passport.use(new OpenIDStrategy({
         user.save((err) => {
           done(err, user);
         });
-      } else {
-        done(error, null);
-      }
-    });
+      }).catch((err) => {
+        done(err, null);
+      });
   }
 }));
 
